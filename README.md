@@ -6,13 +6,6 @@ curated digest email to your inbox — completely free.
 
 ## Stack
 
-| Component | Service | Cost |
-|---|---|---|
-| Movie data | TMDB API | Free |
-| AI scoring | Google Gemini 1.5 Flash | Free (1500 req/day) |
-| Email | Gmail SMTP | Free |
-| Scheduler | GitHub Actions | Free |
-
 ---
 
 ## Setup (15 minutes)
@@ -33,49 +26,9 @@ curated digest email to your inbox — completely free.
 3. Select app: **Mail** → Generate
 4. Copy the 16-character password (no spaces)
 
-### 4. Set up the GitHub repo
-```bash
-# Create a new repo and push these files
-git init
-git add agent.py .github/workflows/movie_agent.yml README.md
-git commit -m "Add movie recommendation agent"
-git remote add origin https://github.com/YOUR_USERNAME/movie-agent.git
-git push -u origin main
-```
 
-### 5. Add secrets to GitHub
-Go to your repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
 
-Add these 5 secrets:
 
-| Secret name | Value |
-|---|---|
-| `TMDB_API_KEY` | Your TMDB v3 API key |
-| `GEMINI_API_KEY` | Your Gemini API key |
-| `GMAIL_ADDRESS` | your.email@gmail.com |
-| `GMAIL_APP_PASSWORD` | The 16-char app password |
-| `RECIPIENT_EMAIL` | Where to send the digest |
-
-### 6. Test it manually
-Go to your repo → **Actions** → **Movie Recommendation Agent** → **Run workflow**
-
-Check your inbox within ~2 minutes!
-
----
-
-## Customise your taste
-
-Edit `agent.py`, find the `TASTE_PROFILE` dict near the top:
-
-```python
-TASTE_PROFILE = {
-    "loved_genres":   ["Comedy", "Romance", "Thriller"],
-    "hated_genres":   ["Horror", "Documentary"],
-    "languages":      ["en", "te", "hi"],
-    "min_rating":     5.5,   # minimum TMDB score (0-10)
-    "top_n":          5,     # how many picks in the email
-}
-```
 
 ---
 
