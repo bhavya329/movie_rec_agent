@@ -1,9 +1,9 @@
 """
-Movie Recommendation Agent
---------------------------
-An agentic AI system that fetches new OTT releases every Friday,
-scores them against your taste profile using Gemini, and emails
-a curated digest to your inbox.
+Movie & Series Recommendation Agent
+-------------------------------------
+Fetches new OTT releases (movies AND series) every Friday,
+scores them against your taste profile using Gemini AI,
+and emails a curated digest — with proper Telugu/Hindi coverage.
 
 Requirements:
     pip install requests google-genai
@@ -13,19 +13,20 @@ Environment variables (set as GitHub Actions secrets):
     GEMINI_API_KEY     — from aistudio.google.com (free)
     GMAIL_ADDRESS      — your Gmail address (sender)
     GMAIL_APP_PASSWORD — Gmail App Password (not your login password)
-    RECIPIENT_EMAIL    — where to send the digest (can be same as above)
+    RECIPIENT_EMAIL    — where to send the digest
 """
 
 import os
 import json
+import time
 import smtplib
 import logging
+from collections import Counter
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import requests
-import time
 from google import genai
 
 # ---------------------------------------------------------------------------
@@ -35,17 +36,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# User taste profile — edit this to match your preferences
+# User taste profile
 # ---------------------------------------------------------------------------
 TASTE_PROFILE = {
     "loved_genres":   ["Comedy", "Romance", "Thriller"],
     "hated_genres":   ["Horror", "Documentary"],
-    "languages":      ["en", "te", "hi"],          # ISO 639-1 codes
+    "languages":      ["en", "te", "hi"],
     "language_names": ["English", "Telugu", "Hindi"],
-    "format":         "Movies only",
-    "min_rating":     5.5,                          # skip anything below this TMDB score
-    "top_n":          5,                            # number of picks to include in email
+    "min_rating":     5.0,
+    "top_n":          6,       # picks in email (2 per language ideally)
 }
+
+LANG_NAMES = {"en": "English", "te": "Telugu", "hi": "Hindi"}
 
 # ---------------------------------------------------------------------------
 # TMDB helpers
@@ -53,148 +55,219 @@ TASTE_PROFILE = {
 TMDB_BASE = "https://api.themoviedb.org/3"
 
 def tmdb_get(endpoint: str, params: dict) -> dict:
-    """Make a GET request to TMDB and return JSON."""
     params["api_key"] = os.environ["TMDB_API_KEY"]
     resp = requests.get(f"{TMDB_BASE}{endpoint}", params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 
-def tool_search_new_releases() -> list[dict]:
-    """
-    Tool: Fetch movies released in the last 14 days on OTT in India.
-    Returns a list of raw TMDB movie objects.
-    """
-    log.info("Tool called: search_new_releases")
+# ---------------------------------------------------------------------------
+# Tool 1 — Search new MOVIES
+# ---------------------------------------------------------------------------
+def tool_search_new_movies() -> list[dict]:
+    log.info("Tool called: search_new_movies")
     today = datetime.utcnow().date()
-    two_weeks_ago = today - timedelta(days=14)
+    days_ago = today - timedelta(days=45)   # wider window catches more Indian releases
+    all_items = []
 
-    all_movies = []
+    # Per-language discover (most reliable for Telugu/Hindi)
     for lang in TASTE_PROFILE["languages"]:
-        data = tmdb_get("/discover/movie", {
-            "with_original_language": lang,
-            "primary_release_date.gte": str(two_weeks_ago),
-            "primary_release_date.lte": str(today),
-            "region": "IN",
-            "sort_by": "popularity.desc",
-            "with_watch_monetization_types": "flatrate|free",
-            "watch_region": "IN",
-            "page": 1,
-        })
-        movies = data.get("results", [])
-        log.info("  Found %d movies for language '%s'", len(movies), lang)
-        all_movies.extend(movies)
+        for page in [1, 2]:   # 2 pages = up to 40 results per language
+            data = tmdb_get("/discover/movie", {
+                "with_original_language": lang,
+                "primary_release_date.gte": str(days_ago),
+                "primary_release_date.lte": str(today),
+                "sort_by": "release_date.desc",
+                "vote_count.gte": 3,
+                "page": page,
+            })
+            items = data.get("results", [])
+            if not items:
+                break
+            log.info("  Movies discover lang=%s page=%d: %d results", lang, page, len(items))
+            all_items.extend(items)
 
-    # Deduplicate by movie id
+    # Weekly trending (catches viral Indian hits)
+    data = tmdb_get("/trending/movie/week", {})
+    for m in data.get("results", []):
+        if m.get("original_language") in TASTE_PROFILE["languages"]:
+            all_items.append(m)
+    log.info("  Movies trending/week: checked")
+
+    return _dedup(all_items, "movie")
+
+
+# ---------------------------------------------------------------------------
+# Tool 2 — Search new SERIES (TV shows)
+# ---------------------------------------------------------------------------
+def tool_search_new_series() -> list[dict]:
+    log.info("Tool called: search_new_series")
+    today = datetime.utcnow().date()
+    days_ago = today - timedelta(days=45)
+    all_items = []
+
+    for lang in TASTE_PROFILE["languages"]:
+        for page in [1, 2]:
+            data = tmdb_get("/discover/tv", {
+                "with_original_language": lang,
+                "first_air_date.gte": str(days_ago),
+                "first_air_date.lte": str(today),
+                "sort_by": "first_air_date.desc",
+                "vote_count.gte": 3,
+                "page": page,
+            })
+            items = data.get("results", [])
+            if not items:
+                break
+            log.info("  Series discover lang=%s page=%d: %d results", lang, page, len(items))
+            all_items.extend(items)
+
+    # Weekly trending TV
+    data = tmdb_get("/trending/tv/week", {})
+    for m in data.get("results", []):
+        if m.get("original_language") in TASTE_PROFILE["languages"]:
+            all_items.append(m)
+    log.info("  Series trending/week: checked")
+
+    return _dedup(all_items, "tv")
+
+
+def _dedup(items: list[dict], media_type: str) -> list[dict]:
     seen = set()
     unique = []
-    for m in all_movies:
-        if m["id"] not in seen:
-            seen.add(m["id"])
+    for m in items:
+        mid = m.get("id")
+        if mid and mid not in seen:
+            seen.add(mid)
+            m["media_type"] = media_type
             unique.append(m)
-
-    log.info("Total unique movies found: %d", len(unique))
+    counts = Counter(m.get("original_language", "?") for m in unique)
+    log.info("  Deduped %s: %d unique | %s", media_type, len(unique), dict(counts))
     return unique
 
 
-def tool_get_movie_details(movie_id: int) -> dict:
-    """
-    Tool: Get full details for a movie — genres, runtime, tagline, OTT platforms.
-    Returns enriched movie dict or None on failure.
-    """
-    log.info("Tool called: get_movie_details(%d)", movie_id)
+# ---------------------------------------------------------------------------
+# Tool 3 — Get full details for a movie or TV show
+# ---------------------------------------------------------------------------
+def tool_get_details(item_id: int, media_type: str) -> dict | None:
+    log.info("Tool called: get_details(%d, %s)", item_id, media_type)
     try:
-        details = tmdb_get(f"/movie/{movie_id}", {
+        endpoint = f"/{'movie' if media_type == 'movie' else 'tv'}/{item_id}"
+        details = tmdb_get(endpoint, {
             "append_to_response": "watch/providers",
             "language": "en-US",
         })
 
-        # Extract OTT platforms available in India
+        # OTT platforms in India
         providers_raw = details.get("watch/providers", {}).get("results", {}).get("IN", {})
-        flatrate = providers_raw.get("flatrate", [])
-        free     = providers_raw.get("free", [])
-        platforms = list({p["provider_name"] for p in flatrate + free})
+        platforms = list({
+            p["provider_name"]
+            for p in providers_raw.get("flatrate", []) + providers_raw.get("free", [])
+        })
 
         genres = [g["name"] for g in details.get("genres", [])]
 
-        return {
-            "id":          movie_id,
-            "title":       details.get("title", "Unknown"),
-            "language":    details.get("original_language", ""),
-            "overview":    details.get("overview", ""),
-            "genres":      genres,
-            "rating":      round(details.get("vote_average", 0), 1),
-            "vote_count":  details.get("vote_count", 0),
-            "runtime":     details.get("runtime", 0),
-            "tagline":     details.get("tagline", ""),
-            "release":     details.get("release_date", ""),
-            "platforms":   platforms,
-            "poster":      details.get("poster_path", ""),
+        # Normalize movie vs TV fields
+        if media_type == "movie":
+            title    = details.get("title", "Unknown")
+            runtime  = details.get("runtime", 0)
+            released = details.get("release_date", "")
+        else:
+            title    = details.get("name", "Unknown")
+            seasons  = details.get("number_of_seasons", 1)
+            episodes = details.get("number_of_episodes", 1)
+            runtime  = 0   # not applicable for series
+            released = details.get("first_air_date", "")
+
+        result = {
+            "id":         item_id,
+            "media_type": media_type,
+            "title":      title,
+            "language":   details.get("original_language", ""),
+            "overview":   details.get("overview", ""),
+            "genres":     genres,
+            "rating":     round(details.get("vote_average", 0), 1),
+            "vote_count": details.get("vote_count", 0),
+            "runtime":    runtime,
+            "release":    released,
+            "platforms":  platforms,
         }
+        if media_type == "tv":
+            result["seasons"]  = seasons
+            result["episodes"] = episodes
+        return result
+
     except Exception as exc:
-        log.warning("  Failed to get details for %d: %s", movie_id, exc)
+        log.warning("  Failed to get details for %d (%s): %s", item_id, media_type, exc)
         return None
 
 
-def tool_filter_by_language(movies: list[dict]) -> list[dict]:
-    """
-    Tool: Keep only movies in the user's preferred languages and
-    above the minimum rating threshold.
-    """
-    log.info("Tool called: filter_by_language (%d movies in)", len(movies))
+# ---------------------------------------------------------------------------
+# Tool 4 — Filter by language, rating, and hated genres
+# ---------------------------------------------------------------------------
+def tool_filter(items: list[dict]) -> list[dict]:
+    log.info("Tool called: filter (%d items in)", len(items))
     allowed = set(TASTE_PROFILE["languages"])
-    filtered = [
-        m for m in movies
-        if m.get("original_language") in allowed
-        and m.get("vote_average", 0) >= TASTE_PROFILE["min_rating"]
-    ]
-    log.info("  %d movies remain after language/rating filter", len(filtered))
+    hated   = set(g.lower() for g in TASTE_PROFILE["hated_genres"])
+
+    filtered = []
+    for m in items:
+        if m.get("original_language") not in allowed:
+            continue
+        rating = m.get("vote_average", 0) or m.get("rating", 0)
+        if rating < TASTE_PROFILE["min_rating"]:
+            continue
+        filtered.append(m)
+
+    counts = Counter(m.get("original_language", "?") for m in filtered)
+    log.info("  After filter: %d items | %s", len(filtered), dict(counts))
     return filtered
 
 
-# ---------------------------------------------------------------------------
-# Gemini AI helper
-# ---------------------------------------------------------------------------
+def tool_filter_hated_genres(items: list[dict]) -> list[dict]:
+    hated = set(g.lower() for g in TASTE_PROFILE["hated_genres"])
+    clean = [m for m in items if not any(g.lower() in hated for g in m.get("genres", []))]
+    log.info("  After genre filter: %d items remain", len(clean))
+    return clean
 
-def tool_score_taste_match(movies: list[dict]) -> list[dict]:
-    """
-    Tool: Ask Gemini to score and reason about each movie against the
-    user's taste profile. Returns movies sorted by match score descending.
-    """
-    log.info("Tool called: score_taste_match (%d movies)", len(movies))
+
+# ---------------------------------------------------------------------------
+# Tool 5 — Gemini AI taste scoring
+# ---------------------------------------------------------------------------
+def tool_score_taste_match(items: list[dict]) -> list[dict]:
+    log.info("Tool called: score_taste_match (%d items)", len(items))
 
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     profile_summary = (
-        f"The user loves: {', '.join(TASTE_PROFILE['loved_genres'])}. "
-        f"They hate: {', '.join(TASTE_PROFILE['hated_genres'])}. "
-        f"They prefer {TASTE_PROFILE['format']} in "
-        f"{', '.join(TASTE_PROFILE['language_names'])}."
+        f"Loves: {', '.join(TASTE_PROFILE['loved_genres'])}. "
+        f"Hates: {', '.join(TASTE_PROFILE['hated_genres'])}. "
+        f"Languages: {', '.join(TASTE_PROFILE['language_names'])}. "
+        f"Wants both movies and series."
     )
 
-    # Compact prompt — keep tokens low to avoid free-tier quota hits
-    movie_list = []
-    for m in movies:
-        movie_list.append({
-            "id":       m["id"],
-            "title":    m["title"],
-            "genres":   m["genres"],
-            "rating":   m["rating"],
-            "overview": m["overview"][:200],
-            "language": m["language"],
+    compact = []
+    for m in items:
+        compact.append({
+            "id":         m["id"],
+            "type":       m["media_type"],
+            "title":      m["title"],
+            "genres":     m["genres"],
+            "rating":     m.get("rating", m.get("vote_average", 0)),
+            "overview":   m.get("overview", "")[:200],
+            "language":   m["language"],
         })
 
     prompt = (
-        f"You are a movie recommendation agent. Score each movie for this user.\n\n"
+        f"You are a movie/series recommendation agent.\n\n"
         f"USER TASTE: {profile_summary}\n\n"
-        f"MOVIES:\n{json.dumps(movie_list, ensure_ascii=False)}\n\n"
-        f'Return ONLY a JSON array, no markdown:\n'
+        f"CONTENT TO SCORE:\n{json.dumps(compact, ensure_ascii=False)}\n\n"
+        f"Return ONLY a JSON array, no markdown, no explanation:\n"
         f'[{{"id":<id>,"match_score":<0-100>,"match_reason":"<max 12 words>"}}]'
     )
 
-    # Retry up to 3 times on quota errors with backoff
     raw = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = client.models.generate_content(
                 model="gemini-2.0-flash-lite",
@@ -212,15 +285,14 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
                 raise
 
     if raw is None:
-        log.warning("Gemini unavailable after retries. Falling back to genre-based scoring.")
+        log.warning("Gemini unavailable. Falling back to genre-based scoring.")
         loved = set(g.lower() for g in TASTE_PROFILE["loved_genres"])
-        enriched = []
-        for m in movies:
+        for m in items:
             overlap = len(loved & set(g.lower() for g in m.get("genres", [])))
-            score = min(50 + overlap * 20, 95)
-            enriched.append({**m, "match_score": score, "match_reason": "Scored by genre match (AI unavailable)."})
-        enriched.sort(key=lambda x: x["match_score"], reverse=True)
-        return enriched
+            m["match_score"]  = min(50 + overlap * 20, 95)
+            m["match_reason"] = "Scored by genre match (AI unavailable)."
+        items.sort(key=lambda x: x["match_score"], reverse=True)
+        return items
 
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -228,268 +300,276 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
             raw = raw[4:]
     raw = raw.strip()
 
-    scores = json.loads(raw)
+    scores    = json.loads(raw)
     score_map = {s["id"]: s for s in scores}
 
-    # Merge scores back into movie dicts
     enriched = []
-    for m in movies:
+    for m in items:
         s = score_map.get(m["id"], {"match_score": 0, "match_reason": "No match data."})
         enriched.append({**m, **s})
 
     enriched.sort(key=lambda x: x["match_score"], reverse=True)
-    log.info("AI scoring complete. Top movie: %s (score %s)",
-             enriched[0]["title"] if enriched else "none",
-             enriched[0]["match_score"] if enriched else 0)
+    log.info("Top pick: %s (%s)", enriched[0]["title"] if enriched else "none",
+             enriched[0].get("match_score", 0) if enriched else 0)
     return enriched
+
+
+# ---------------------------------------------------------------------------
+# Tool 6 — Pick balanced set (spread across languages)
+# ---------------------------------------------------------------------------
+def tool_pick_balanced(items: list[dict], n: int) -> list[dict]:
+    """
+    Ensure the final picks include Telugu and Hindi content,
+    not just English. Takes top scoring item per language first,
+    then fills remaining slots by score.
+    """
+    log.info("Tool called: pick_balanced (n=%d)", n)
+    by_lang = {"te": [], "hi": [], "en": []}
+    for m in items:
+        lang = m.get("language", "")
+        if lang in by_lang:
+            by_lang[lang].append(m)
+
+    picks = []
+    # Reserve at least 1 slot for each language that has content
+    for lang in ["te", "hi", "en"]:
+        if by_lang[lang]:
+            picks.append(by_lang[lang][0])
+
+    # Fill remaining slots by overall score
+    picked_ids = {m["id"] for m in picks}
+    remaining  = [m for m in items if m["id"] not in picked_ids]
+    for m in remaining:
+        if len(picks) >= n:
+            break
+        picks.append(m)
+
+    log.info("Balanced picks: %s", [(m["title"], m.get("language")) for m in picks])
+    return picks[:n]
 
 
 # ---------------------------------------------------------------------------
 # Email builder
 # ---------------------------------------------------------------------------
-
-LANG_MAP = {"en": "English", "te": "Telugu", "hi": "Hindi"}
-
-def _runtime_str(minutes: int) -> str:
-    if not minutes:
+def _runtime_str(m: dict) -> str:
+    if m["media_type"] == "tv":
+        s = m.get("seasons", 1)
+        e = m.get("episodes", 1)
+        return f"{s} season{'s' if s > 1 else ''} · {e} ep{'s' if e > 1 else ''}"
+    mins = m.get("runtime", 0)
+    if not mins:
         return ""
-    h, m = divmod(minutes, 60)
-    return f"{h}h {m}m" if h else f"{m}m"
+    h, mi = divmod(mins, 60)
+    return f"{h}h {mi}m" if h else f"{mi}m"
 
 
 def _platform_badges(platforms: list[str]) -> str:
     colors = {
-        "Netflix":      ("#E50914", "#fff"),
-        "Prime Video":  ("#00A8E1", "#fff"),
-        "Disney+ Hotstar": ("#1D6EC5", "#fff"),
-        "Zee5":         ("#8B2FC9", "#fff"),
-        "SonyLIV":      ("#D2182B", "#fff"),
+        "Netflix":             ("#E50914", "#fff"),
+        "Prime Video":         ("#00A8E1", "#fff"),
+        "Disney+ Hotstar":     ("#1D6EC5", "#fff"),
+        "Zee5":                ("#8B2FC9", "#fff"),
+        "SonyLIV":             ("#D2182B", "#fff"),
+        "Apple TV+":           ("#000000", "#fff"),
+        "JioCinema":           ("#5C3BC0", "#fff"),
     }
     badges = ""
     for p in platforms[:3]:
-        bg, fg = colors.get(p, ("#444", "#fff"))
+        bg, fg = colors.get(p, ("#555", "#fff"))
         badges += (
             f'<span style="background:{bg};color:{fg};padding:2px 8px;'
             f'border-radius:99px;font-size:11px;margin-right:4px;">{p}</span>'
         )
-    return badges or '<span style="color:#888;font-size:12px;">OTT platform TBC</span>'
+    return badges or '<span style="color:#888;font-size:12px;">Platform TBC</span>'
 
 
-def build_email_html(movies: list[dict]) -> str:
+def _type_badge(media_type: str) -> str:
+    if media_type == "tv":
+        return '<span style="background:#E1F5EE;color:#085041;font-size:11px;padding:2px 8px;border-radius:99px;margin-right:4px;">Series</span>'
+    return '<span style="background:#EEEDFE;color:#3C3489;font-size:11px;padding:2px 8px;border-radius:99px;margin-right:4px;">Movie</span>'
+
+
+def build_email_html(items: list[dict]) -> str:
     today_str = datetime.utcnow().strftime("%B %d, %Y")
-    top = movies[0] if movies else None
-
     cards = ""
-    for i, m in enumerate(movies):
-        border = "border: 1.5px solid #185FA5;" if i == 0 else "border: 1px solid #e0e0e0;"
+
+    for i, m in enumerate(items):
+        border   = "border: 1.5px solid #185FA5;" if i == 0 else "border: 1px solid #e0e0e0;"
         top_badge = (
             '<span style="background:#E6F1FB;color:#0C447C;font-size:11px;'
             'padding:2px 8px;border-radius:99px;margin-bottom:8px;display:inline-block;">'
-            '⭐ Top pick for you</span><br>' if i == 0 else ""
-        )
+            '⭐ Top pick for you</span><br>'
+        ) if i == 0 else ""
+
         genre_tags = "".join(
-            f'<span style="background:#EEEDFE;color:#3C3489;font-size:11px;'
+            f'<span style="background:#FFF3E0;color:#E65100;font-size:11px;'
             f'padding:2px 8px;border-radius:99px;margin-right:4px;">{g}</span>'
-            for g in m["genres"][:3]
+            for g in m.get("genres", [])[:3]
         )
-        lang_label = LANG_MAP.get(m["language"], m["language"].upper())
-        runtime    = _runtime_str(m.get("runtime", 0))
-        bar_width  = m["match_score"]
+        lang_label = LANG_NAMES.get(m.get("language", ""), m.get("language", "").upper())
+        runtime    = _runtime_str(m)
+        bar_width  = m.get("match_score", 0)
         bar_color  = "#185FA5" if bar_width >= 70 else "#639922" if bar_width >= 50 else "#BA7517"
+        rating     = m.get("rating", m.get("vote_average", 0))
 
         cards += f"""
 <div style="background:#fff;{border}border-radius:12px;padding:16px;margin-bottom:12px;">
   {top_badge}
-  <div style="font-size:17px;font-weight:500;color:#1a1a1a;margin-bottom:4px;">{m['title']}</div>
-  <div style="font-size:12px;color:#666;margin-bottom:8px;">
-    ⭐ {m['rating']} &nbsp;·&nbsp; {lang_label} &nbsp;·&nbsp; {runtime}
+  <div style="margin-bottom:6px;">
+    {_type_badge(m['media_type'])}
+    <span style="background:#F5F5F5;color:#555;font-size:11px;padding:2px 8px;border-radius:99px;">{lang_label}</span>
   </div>
+  <div style="font-size:17px;font-weight:500;color:#1a1a1a;margin-bottom:4px;">{m['title']}</div>
+  <div style="font-size:12px;color:#666;margin-bottom:8px;">⭐ {rating} &nbsp;·&nbsp; {runtime}</div>
   <div style="margin-bottom:8px;">{genre_tags}</div>
-  <div style="margin-bottom:8px;">{_platform_badges(m.get('platforms', []))}</div>
+  <div style="margin-bottom:10px;">{_platform_badges(m.get('platforms', []))}</div>
   <div style="margin-bottom:6px;">
     <div style="display:flex;justify-content:space-between;font-size:12px;color:#666;margin-bottom:3px;">
-      <span>Taste match</span><span style="font-weight:500;color:#1a1a1a;">{m['match_score']}%</span>
+      <span>Taste match</span><span style="font-weight:500;color:#1a1a1a;">{bar_width}%</span>
     </div>
     <div style="height:4px;background:#eee;border-radius:99px;">
       <div style="width:{bar_width}%;height:4px;background:{bar_color};border-radius:99px;"></div>
     </div>
   </div>
-  <div style="font-size:12px;color:#666;font-style:italic;">{m.get('match_reason','')}</div>
-</div>
-"""
+  <div style="font-size:12px;color:#666;font-style:italic;">{m.get('match_reason', '')}</div>
+</div>"""
 
-    html = f"""<!DOCTYPE html>
+    movies_count = sum(1 for m in items if m["media_type"] == "movie")
+    series_count = len(items) - movies_count
+
+    return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;margin:0;padding:24px;">
 <div style="max-width:560px;margin:0 auto;">
-
-  <!-- Header -->
   <div style="background:#185FA5;border-radius:12px;padding:20px 24px;margin-bottom:16px;">
-    <div style="font-size:22px;font-weight:500;color:#fff;margin-bottom:4px;">🎬 Your Friday Movie Picks</div>
-    <div style="font-size:13px;color:#B5D4F4;">{today_str} &nbsp;·&nbsp; Curated by your Movie Agent</div>
+    <div style="font-size:22px;font-weight:500;color:#fff;margin-bottom:4px;">🎬 Your Friday Picks</div>
+    <div style="font-size:13px;color:#B5D4F4;">{today_str} &nbsp;·&nbsp; Movies &amp; Series · EN / TE / HI</div>
   </div>
-
-  <!-- Intro -->
   <div style="background:#fff;border:1px solid #e0e0e0;border-radius:12px;padding:16px 20px;margin-bottom:16px;font-size:14px;color:#444;line-height:1.6;">
-    Hey! I scanned all new OTT releases in India this week across Netflix, Prime Video, Hotstar and more.
-    Here are your top <strong>{len(movies)} picks</strong> matched to your taste —
-    <strong>Comedy, Romance & Thriller</strong> in English, Telugu and Hindi.
+    Here are your top <strong>{len(items)} picks</strong> this week —
+    <strong>{movies_count} movie{'s' if movies_count != 1 else ''}</strong> and
+    <strong>{series_count} series</strong> in English, Telugu &amp; Hindi,
+    matched to your taste (Comedy · Romance · Thriller).
   </div>
-
-  <!-- Movie cards -->
   {cards}
-
-  <!-- Footer -->
   <div style="font-size:11px;color:#aaa;text-align:center;margin-top:16px;line-height:1.6;">
-    Powered by your personal Movie Agent · TMDB + Gemini AI<br>
-    Runs every Friday at 7 PM IST via GitHub Actions · Completely free
+    Powered by your Movie Agent · TMDB + Gemini AI · Runs every Friday at 7 PM IST
   </div>
-
 </div>
 </body>
 </html>"""
-    return html
 
 
-def tool_send_email(movies: list[dict]) -> bool:
-    """
-    Tool: Compose and send the weekly digest email via Gmail SMTP.
-    """
-    log.info("Tool called: send_email")
+# ---------------------------------------------------------------------------
+# Tool 7 — Send email
+# ---------------------------------------------------------------------------
+def tool_send_email(items: list[dict]) -> bool:
+    log.info("Tool called: send_email (%d picks)", len(items))
 
     sender    = os.environ["GMAIL_ADDRESS"].strip()
     recipient = os.environ["RECIPIENT_EMAIL"].strip()
     password  = "".join(c for c in os.environ["GMAIL_APP_PASSWORD"] if c.isascii() and not c.isspace())
 
-    log.info("Sender:          %s", sender)
-    log.info("Recipient:       %s", recipient)
-    log.info("Password length: %d chars (should be 16)", len(password))
+    log.info("Sender: %s | Recipient: %s | Password length: %d", sender, recipient, len(password))
 
-    html = build_email_html(movies)
+    movies_count = sum(1 for m in items if m["media_type"] == "movie")
+    series_count = len(items) - movies_count
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🎬 Your Friday movie picks — {len(movies)} new releases matched to you"
+    msg["Subject"] = f"🎬 Friday picks — {movies_count} movies + {series_count} series matched to you"
     msg["From"]    = sender
     msg["To"]      = recipient
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(build_email_html(items), "html"))
 
     try:
-        log.info("Connecting to smtp.gmail.com:465 ...")
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.set_debuglevel(1)
-            log.info("Logging in ...")
             server.login(sender, password)
-            log.info("Login successful. Sending message ...")
             server.sendmail(sender, recipient, msg.as_string())
-            log.info("✅ Email sent successfully to %s", recipient)
+        log.info("✅ Email sent to %s", recipient)
         return True
     except smtplib.SMTPAuthenticationError as e:
-        log.error("❌ Gmail authentication failed: %s", e)
-        log.error("Fix: Go to myaccount.google.com/apppasswords, delete the old password,")
-        log.error("     generate a new one, and update the GMAIL_APP_PASSWORD GitHub secret.")
-        raise
-    except smtplib.SMTPException as e:
-        log.error("❌ SMTP error while sending: %s", e)
+        log.error("❌ Gmail auth failed: %s", e)
         raise
     except Exception as e:
-        log.error("❌ Unexpected error: %s", e)
+        log.error("❌ Email error: %s", e)
         raise
 
 
 # ---------------------------------------------------------------------------
 # The Agent — reasoning loop
 # ---------------------------------------------------------------------------
-
 def run_agent():
-    """
-    Agentic reasoning loop.
-
-    The agent is given a goal and decides which tools to call,
-    in what order, and when it has enough information to finish.
-    """
     log.info("=" * 60)
-    log.info("Movie Recommendation Agent starting")
-    log.info("Goal: Find the best new OTT movie releases for the user and send a digest email.")
+    log.info("Movie & Series Recommendation Agent starting")
+    log.info("Goal: Find best new OTT movies AND series in EN/TE/HI and email digest.")
     log.info("=" * 60)
 
-    # --- Step 1: Agent decides to search for new releases ---
-    log.info("Agent reasoning: I need to find what's new on OTT this week.")
-    raw_movies = tool_search_new_releases()
+    # Step 1: Search movies and series in parallel
+    log.info("Agent reasoning: searching new movies and series separately for better coverage.")
+    raw_movies = tool_search_new_movies()
+    raw_series = tool_search_new_series()
+    all_raw    = raw_movies + raw_series
+    log.info("Agent: %d movies + %d series = %d total raw items", len(raw_movies), len(raw_series), len(all_raw))
 
-    if not raw_movies:
-        log.warning("Agent: No movies found at all. Aborting.")
+    if not all_raw:
+        log.error("Agent: Nothing found at all. Aborting.")
         return
 
-    # --- Step 2: Agent decides to filter by language & rating ---
-    log.info("Agent reasoning: %d movies found. Too many — I'll filter by user's preferred languages and minimum rating.", len(raw_movies))
-    filtered = tool_filter_by_language(raw_movies)
+    # Step 2: Filter by language and rating
+    log.info("Agent reasoning: filtering by language (EN/TE/HI) and min rating %.1f", TASTE_PROFILE["min_rating"])
+    filtered = tool_filter(all_raw)
 
     if not filtered:
-        log.warning("Agent: No movies left after filtering. Trying with a lower rating bar.")
-        # Agent adapts: retry with a lower threshold
-        original_min = TASTE_PROFILE["min_rating"]
+        log.warning("Agent: nothing after filter — lowering rating bar to 4.0")
         TASTE_PROFILE["min_rating"] = 4.0
-        filtered = tool_filter_by_language(raw_movies)
-        TASTE_PROFILE["min_rating"] = original_min
+        filtered = tool_filter(all_raw)
         if not filtered:
-            log.error("Agent: Still no movies. Giving up.")
+            log.error("Agent: still nothing. Aborting.")
             return
 
-    # --- Step 3: Agent decides to fetch full details for each movie ---
-    log.info("Agent reasoning: I have %d candidates. I need ratings, genres and platforms before I can score them.", len(filtered))
+    # Step 3: Fetch full details (genres, platforms, runtime)
+    log.info("Agent reasoning: fetching full details for %d candidates.", len(filtered))
     detailed = []
     for m in filtered:
-        details = tool_get_movie_details(m["id"])
-        if details:
-            detailed.append(details)
+        d = tool_get_details(m["id"], m.get("media_type", "movie"))
+        if d:
+            detailed.append(d)
 
     if not detailed:
-        log.error("Agent: Could not fetch details for any movie. Aborting.")
+        log.error("Agent: could not fetch details. Aborting.")
         return
 
-    # Agent filters out hated genres before calling AI (saves tokens)
-    hated = set(g.lower() for g in TASTE_PROFILE["hated_genres"])
-    pre_filtered = [
-        m for m in detailed
-        if not any(g.lower() in hated for g in m.get("genres", []))
-    ]
-    log.info("Agent reasoning: After removing hated genres, %d movies remain. Sending to AI scorer.", len(pre_filtered))
+    # Step 4: Remove hated genres
+    log.info("Agent reasoning: removing hated genres before AI scoring.")
+    clean = tool_filter_hated_genres(detailed)
+    if not clean:
+        log.warning("Agent: all items in hated genres. Using all detailed items.")
+        clean = detailed
 
-    if not pre_filtered:
-        log.warning("Agent: All remaining movies are in hated genres. Nothing to recommend.")
-        return
+    # Step 5: AI taste scoring
+    log.info("Agent reasoning: sending %d items to Gemini for taste scoring.", len(clean))
+    scored = tool_score_taste_match(clean)
 
-    # --- Step 4: Agent calls Gemini to score each movie ---
-    log.info("Agent reasoning: Calling Gemini to score each movie against the user's taste profile.")
-    scored = tool_score_taste_match(pre_filtered)
+    # Step 6: Pick balanced set across languages
+    log.info("Agent reasoning: picking balanced set ensuring TE/HI/EN representation.")
+    good   = [m for m in scored if m.get("match_score", 0) >= 35]
+    if not good:
+        good = scored
+    top_picks = tool_pick_balanced(good, TASTE_PROFILE["top_n"])
 
-    # Agent decides: keep only top N with score above 40
-    top_picks = [m for m in scored if m["match_score"] >= 40][: TASTE_PROFILE["top_n"]]
-
-    if not top_picks:
-        log.info("Agent reasoning: No movies scored above 40. Taking top 3 anyway.")
-        top_picks = scored[: 3]
-
-    log.info("Agent reasoning: I have %d high-quality picks. Composing and sending the email.", len(top_picks))
-
-    # --- Step 5: Agent sends the email ---
-    success = tool_send_email(top_picks)
-
-    if success:
-        log.info("Agent: Goal achieved. Email delivered. Shutting down.")
-    else:
-        log.error("Agent: Email delivery failed.")
+    # Step 7: Send email
+    log.info("Agent reasoning: %d picks ready. Sending email.", len(top_picks))
+    tool_send_email(top_picks)
+    log.info("Agent: goal achieved. Done.")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Validate required env vars before starting
     required = ["TMDB_API_KEY", "GEMINI_API_KEY", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "RECIPIENT_EMAIL"]
     missing  = [k for k in required if not os.environ.get(k)]
     if missing:
-        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
-
+        raise EnvironmentError(f"Missing required env vars: {', '.join(missing)}")
     run_agent()
