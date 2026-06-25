@@ -203,12 +203,14 @@ def tool_read_feedback():
         return {}
     try:
         url = f"https://api.github.com/repos/{repo}/contents/{FEEDBACK_FILE}"
+        print(f"  Fetching feedback.json from {url}")
         req = urllib.request.Request(url, headers={
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
             data    = json.loads(resp.read())
+            print(f"  feedback.json fetched: {data.get('size',0)} bytes")
             content = base64.b64decode(data["content"]).decode("utf-8")
             feedback = json.loads(content)
             log.info("  Loaded feedback: %d entries", len(feedback))
@@ -521,7 +523,8 @@ def run_agent():
     log.info("="*60)
     log.info("Movie & Series Agent — OTT only | feedback memory | multi-recipient")
     log.info("="*60)
-
+    print("GITHUB_REPO =", os.environ.get("GITHUB_REPO"))
+    print("TOKEN EXISTS =", bool(os.environ.get("GITHUB_TOKEN")))
     # Step 1: Read feedback memory
     log.info("Agent: Reading feedback memory to enrich taste profile...")
     feedback = tool_read_feedback()

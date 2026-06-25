@@ -49,6 +49,7 @@ jobs:
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAILS:     ${{ secrets.RECIPIENT_EMAIL }}
           GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
         run: python agents.py
 
       # ── 5. Upload logs as artifact (optional but useful for debugging) ──
