@@ -48,7 +48,7 @@ jobs:
           GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL:     ${{ secrets.RECIPIENT_EMAIL }}
-        run: python agent.py
+        run: python agents.py
 
       # ── 5. Upload logs as artifact (optional but useful for debugging) ──
       - name: Upload run log
