@@ -163,7 +163,7 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
     log.info("Tool called: score_taste_match (%d movies)", len(movies))
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     profile_summary = (
         f"The user loves: {', '.join(TASTE_PROFILE['loved_genres'])}. "
