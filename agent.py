@@ -6,7 +6,7 @@ scores them against your taste profile using Gemini, and emails
 a curated digest to your inbox.
 
 Requirements:
-    pip install requests google-generativeai
+    pip install requests google-genai
 
 Environment variables (set as GitHub Actions secrets):
     TMDB_API_KEY       — from themoviedb.org (free)
@@ -25,7 +25,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import requests
-import google.generativeai as genai
+import time
+from google import genai
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -162,8 +163,7 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
     """
     log.info("Tool called: score_taste_match (%d movies)", len(movies))
 
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     profile_summary = (
         f"The user loves: {', '.join(TASTE_PROFILE['loved_genres'])}. "
@@ -172,7 +172,7 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
         f"{', '.join(TASTE_PROFILE['language_names'])}."
     )
 
-    # Build a compact movie list for Gemini (avoid huge prompt)
+    # Compact prompt — keep tokens low to avoid free-tier quota hits
     movie_list = []
     for m in movies:
         movie_list.append({
@@ -180,40 +180,48 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
             "title":    m["title"],
             "genres":   m["genres"],
             "rating":   m["rating"],
-            "overview": m["overview"][:300],   # truncate long synopses
+            "overview": m["overview"][:200],
             "language": m["language"],
         })
 
-    prompt = f"""
-You are a movie recommendation agent. Score each movie for this user:
+    prompt = (
+        f"You are a movie recommendation agent. Score each movie for this user.\n\n"
+        f"USER TASTE: {profile_summary}\n\n"
+        f"MOVIES:\n{json.dumps(movie_list, ensure_ascii=False)}\n\n"
+        f'Return ONLY a JSON array, no markdown:\n'
+        f'[{{"id":<id>,"match_score":<0-100>,"match_reason":"<max 12 words>"}}]'
+    )
 
-USER TASTE PROFILE:
-{profile_summary}
+    # Retry up to 3 times on quota errors with backoff
+    raw = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents=prompt,
+            )
+            raw = response.text.strip()
+            break
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
+                wait = 60 * (attempt + 1)
+                log.warning("Gemini quota hit (attempt %d/3). Waiting %ds ...", attempt + 1, wait)
+                time.sleep(wait)
+            else:
+                raise
 
-MOVIES TO SCORE (JSON list):
-{json.dumps(movie_list, ensure_ascii=False, indent=2)}
+    if raw is None:
+        log.warning("Gemini unavailable after retries. Falling back to genre-based scoring.")
+        loved = set(g.lower() for g in TASTE_PROFILE["loved_genres"])
+        enriched = []
+        for m in movies:
+            overlap = len(loved & set(g.lower() for g in m.get("genres", [])))
+            score = min(50 + overlap * 20, 95)
+            enriched.append({**m, "match_score": score, "match_reason": "Scored by genre match (AI unavailable)."})
+        enriched.sort(key=lambda x: x["match_score"], reverse=True)
+        return enriched
 
-INSTRUCTIONS:
-- For each movie, assign a match_score from 0 to 100.
-- Write a short match_reason (1 sentence, max 15 words) explaining why it does or doesn't fit.
-- Skip movies in hated genres — give them a score of 0.
-- Return ONLY a valid JSON array. No markdown, no preamble, no explanation outside JSON.
-
-REQUIRED OUTPUT FORMAT (array of objects):
-[
-  {{
-    "id": <movie_id>,
-    "match_score": <0-100>,
-    "match_reason": "<one sentence>"
-  }},
-  ...
-]
-"""
-
-    response = model.generate_content(prompt)
-    raw = response.text.strip()
-
-    # Strip accidental markdown fences
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
