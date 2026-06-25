@@ -282,7 +282,7 @@ def tool_score_taste_match(items, taste_context):
     raw = None
     for attempt in range(2):
         try:
-            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+            resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
             raw  = resp.text.strip()
             break
         except Exception as e:
@@ -301,7 +301,7 @@ def tool_score_taste_match(items, taste_context):
         for m in items:
             overlap = len(loved & {g.lower() for g in m.get("genres",[])})
             m["match_score"]  = min(50 + overlap * 20, 95)
-            m["match_reason"] = "Genre-based score (AI unavailable)."
+            m["match_reason"] = "Genre-based score ."
         items.sort(key=lambda x: x["match_score"], reverse=True)
         return items
 
