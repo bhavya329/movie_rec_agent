@@ -262,7 +262,7 @@ def tool_score_taste_match(items, taste_context):
         "title":    m["title"],
         "genres":   m["genres"],
         "rating":   m.get("rating", 0),
-        "overview": m.get("overview","")[:200],
+        "overview": m.get("overview","")[:80],
         "language": m["language"],
     } for m in items]
 
@@ -278,16 +278,17 @@ def tool_score_taste_match(items, taste_context):
 
     time.sleep(5)
     raw = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
             raw  = resp.text.strip()
             break
         except Exception as e:
+            print(e)
             err = str(e)
             if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                wait = 90 * (2 ** attempt)
-                log.warning("  Gemini quota hit (%d/3). Waiting %ds...", attempt+1, wait)
+                wait = 60 * (2 ** attempt)
+                log.warning("  Gemini quota hit (%d/2). Waiting %ds...", attempt+1, wait)
                 time.sleep(wait)
             else:
                 raise
