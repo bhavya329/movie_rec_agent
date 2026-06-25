@@ -194,7 +194,7 @@ def tool_score_taste_match(movies: list[dict]) -> list[dict]:
 
     # Retry up to 3 times on quota errors with backoff
     raw = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             response = client.models.generate_content(
                 model="gemini-2.0-flash-lite",
@@ -360,7 +360,7 @@ def tool_send_email(movies: list[dict]) -> bool:
 
     sender    = os.environ["GMAIL_ADDRESS"].strip()
     recipient = os.environ["RECIPIENT_EMAIL"].strip()
-    password  = os.environ["GMAIL_APP_PASSWORD"].strip().replace(" ", "")
+    password  = "".join(c for c in os.environ["GMAIL_APP_PASSWORD"] if c.isascii() and not c.isspace())
 
     log.info("Sender:          %s", sender)
     log.info("Recipient:       %s", recipient)
