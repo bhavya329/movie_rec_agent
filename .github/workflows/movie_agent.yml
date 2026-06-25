@@ -47,7 +47,8 @@ jobs:
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
           GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAIL:     ${{ secrets.RECIPIENT_EMAIL }}
+          RECIPIENT_EMAILS:     ${{ secrets.RECIPIENT_EMAIL }}
+          GITHUB_REPO: ${{ github.repository }}
         run: python agents.py
 
       # ── 5. Upload logs as artifact (optional but useful for debugging) ──
