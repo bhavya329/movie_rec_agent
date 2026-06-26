@@ -456,7 +456,8 @@ def build_email_html(items, feedback):
         + "\n".join(fb_lines_prefilled)
         + footer
     )
-    mailto_body = urllib.parse.quote(body_text)
+    mailto_body    = urllib.parse.quote(body_text)
+    mailto_subject = urllib.parse.quote(f"My feedback — {today_str}")
     mailto_href    = f"mailto:{sender_addr}?subject={mailto_subject}&body={mailto_body}"
 
     # Build the visual row list for display in the email
