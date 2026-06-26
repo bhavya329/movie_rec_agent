@@ -41,7 +41,7 @@ jobs:
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
           GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAILS:    ${{ secrets.RECIPIENT_EMAILS }}
+          RECIPIENT_EMAILS:    ${{ secrets.RECIPIENT_EMAIL }}
           GITHUB_TOKEN:        ${{ secrets.ACCESS_TOKEN }}
           GITHUB_REPO:         ${{ github.repository }}
         run: python agent.py
