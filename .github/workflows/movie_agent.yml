@@ -50,7 +50,7 @@ jobs:
           RECIPIENT_EMAILS:     ${{ secrets.RECIPIENT_EMAIL }}
           GITHUB_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        run: python agents.py
+        run: python agent.py
 
       # ── 5. Upload logs as artifact (optional but useful for debugging) ──
       - name: Upload run log
